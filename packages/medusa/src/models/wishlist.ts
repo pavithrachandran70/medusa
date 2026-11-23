@@ -37,12 +37,21 @@ export class Wishlist {
   updated_at!: Date
 
   /**
-   * Populated by `WishlistService.listWishlistItems` from a single join so
-   * callers do not issue one product query per row.
+   * Populated by `WishlistService.listWishlistItems`. Title and thumbnail come
+   * from one product join. Variants and `calculated_price` are attached in a
+   * second batch, not one query per wishlist row.
    */
   product?: {
     id: string
     title?: string | null
     thumbnail?: string | null
+    variants?: {
+      id: string
+      title?: string | null
+      calculated_price: {
+        amount: number
+        currency_code: string
+      } | null
+    }[]
   }
 }

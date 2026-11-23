@@ -21,6 +21,7 @@ medusaIntegrationTestRunner({
     let customer
     let product
     let secondProduct
+    let shippingProfile
 
     beforeAll(async () => {
       appContainer = getContainer()
@@ -45,7 +46,20 @@ medusaIntegrationTestRunner({
         },
       }
 
-      const shippingProfile = (
+      // Wishlist prices are calculated in the store's default currency.
+      // The default store is EUR; these fixtures are priced in USD.
+      const storeModule = appContainer.resolve(Modules.STORE)
+      const [store] = await storeModule.listStores(
+        {},
+        { relations: ["supported_currencies"], take: 1 }
+      )
+      if (store) {
+        await storeModule.updateStores(store.id, {
+          supported_currencies: [{ currency_code: "usd", is_default: true }],
+        })
+      }
+
+      shippingProfile = (
         await api.post(
           `/admin/shipping-profiles`,
           { name: "wishlist", type: "default" },
@@ -383,6 +397,239 @@ medusaIntegrationTestRunner({
           wishlist_items: [],
           count: 0,
         })
+      })
+    })
+
+    describe("Wishlist persistence and product details (Story 3)", () => {
+      it("should persist wishlist items when the customer signs in again (AC 5)", async () => {
+        const result = await createAuthenticatedCustomer(api, storeHeaders, {
+          first_name: "Persistence",
+          last_name: "Test",
+          email: `persistence-${Date.now()}@wishlist.com`,
+        })
+        const headers = {
+          headers: {
+            ...storeHeaders.headers,
+            authorization: `Bearer ${result.jwt}`,
+          },
+        }
+
+        const addResponse = await api.post(
+          `/store/wishlist`,
+          { product_id: product.id },
+          headers
+        )
+        const wishlistItemId = addResponse.data.wishlist_item.id
+
+        const signin = await api.post("/auth/customer/emailpass", {
+          email: result.customer.email,
+          password: "secret_password",
+        })
+        const signedInAgain = {
+          headers: {
+            ...storeHeaders.headers,
+            authorization: `Bearer ${signin.data.token}`,
+          },
+        }
+
+        const listResponse = await api.get(`/store/wishlist`, signedInAgain)
+
+        expect(listResponse.status).toEqual(200)
+        expect(listResponse.data.count).toEqual(1)
+        expect(listResponse.data.wishlist_items).toHaveLength(1)
+        expect(listResponse.data.wishlist_items[0]).toEqual(
+          expect.objectContaining({
+            id: wishlistItemId,
+            customer_id: result.customer.id,
+            product_id: product.id,
+          })
+        )
+      })
+
+      it("should return an empty list for a customer with no wishlist items (AC 7)", async () => {
+        const result = await createAuthenticatedCustomer(api, storeHeaders, {
+          first_name: "Empty",
+          last_name: "Wishlist",
+          email: `empty-${Date.now()}@wishlist.com`,
+        })
+        const authHeaders = {
+          headers: {
+            ...storeHeaders.headers,
+            authorization: `Bearer ${result.jwt}`,
+          },
+        }
+
+        const response = await api.get(`/store/wishlist`, authHeaders)
+
+        expect(response.status).toEqual(200)
+        expect(response.data).toEqual({
+          wishlist_items: [],
+          count: 0,
+        })
+      })
+
+      it("should return product name, image, and calculated price (AC 6)", async () => {
+        const detailProduct = (
+          await api.post(
+            "/admin/products",
+            {
+              title: "Product Details Test Item",
+              thumbnail: "https://example.com/thumbnail.jpg",
+              status: "published",
+              shipping_profile_id: shippingProfile.id,
+              options: [{ title: "Size", values: ["S", "M"] }],
+              variants: [
+                {
+                  title: "Small",
+                  sku: `DETAIL-TEST-S-${Date.now()}`,
+                  options: { Size: "S" },
+                  manage_inventory: false,
+                  prices: [{ amount: 1000, currency_code: "usd" }],
+                },
+                {
+                  title: "Medium",
+                  sku: `DETAIL-TEST-M-${Date.now()}`,
+                  options: { Size: "M" },
+                  manage_inventory: false,
+                  prices: [{ amount: 1200, currency_code: "usd" }],
+                },
+              ],
+            },
+            adminHeaders
+          )
+        ).data.product
+
+        const result = await createAuthenticatedCustomer(api, storeHeaders, {
+          first_name: "Details",
+          last_name: "Test",
+          email: `details-${Date.now()}@example.com`,
+        })
+        const authHeaders = {
+          headers: {
+            ...storeHeaders.headers,
+            authorization: `Bearer ${result.jwt}`,
+          },
+        }
+
+        await api.post(
+          `/store/wishlist`,
+          { product_id: detailProduct.id },
+          authHeaders
+        )
+
+        const response = await api.get(`/store/wishlist`, authHeaders)
+
+        expect(response.status).toEqual(200)
+        expect(response.data.count).toEqual(1)
+        expect(response.data.wishlist_items[0]).toEqual(
+          expect.objectContaining({
+            product_id: detailProduct.id,
+            product: expect.objectContaining({
+              id: detailProduct.id,
+              title: "Product Details Test Item",
+              thumbnail: "https://example.com/thumbnail.jpg",
+              variants: expect.arrayContaining([
+                expect.objectContaining({
+                  id: expect.any(String),
+                  title: expect.any(String),
+                  calculated_price: expect.objectContaining({
+                    amount: expect.any(Number),
+                    currency_code: "usd",
+                  }),
+                }),
+              ]),
+            }),
+          })
+        )
+
+        const variants = response.data.wishlist_items[0].product.variants
+        expect(variants.length).toBeGreaterThan(0)
+        expect(variants[0].calculated_price).toBeDefined()
+        expect(variants[0].calculated_price.amount).toBeGreaterThan(0)
+      })
+
+      it("should return the same wishlist item id when adding a duplicate product (AC 4)", async () => {
+        const result = await createAuthenticatedCustomer(api, storeHeaders, {
+          first_name: "Idempotency",
+          last_name: "Test",
+          email: `idempotency-${Date.now()}@example.com`,
+        })
+        const authHeaders = {
+          headers: {
+            ...storeHeaders.headers,
+            authorization: `Bearer ${result.jwt}`,
+          },
+        }
+
+        const firstAdd = await api.post(
+          `/store/wishlist`,
+          { product_id: product.id },
+          authHeaders
+        )
+        const secondAdd = await api.post(
+          `/store/wishlist`,
+          { product_id: product.id },
+          authHeaders
+        )
+
+        expect(firstAdd.status).toEqual(200)
+        expect(secondAdd.status).toEqual(200)
+        expect(secondAdd.data.wishlist_item.id).toEqual(
+          firstAdd.data.wishlist_item.id
+        )
+
+        const listResponse = await api.get(`/store/wishlist`, authHeaders)
+
+        expect(listResponse.status).toEqual(200)
+        expect(listResponse.data.count).toEqual(1)
+        expect(listResponse.data.wishlist_items).toHaveLength(1)
+      })
+
+      it("should return the existing row when the unique constraint is hit (AC 4)", async () => {
+        const wishlistService = appContainer.resolve("wishlistService")
+        const customerModule = appContainer.resolve(Modules.CUSTOMER)
+        const created = await customerModule.createCustomers({
+          email: `constraint-${Date.now()}@example.com`,
+          first_name: "Constraint",
+          last_name: "Test",
+        })
+
+        const firstAdd = await wishlistService.addToWishlist(
+          created.id,
+          product.id
+        )
+        const secondAdd = await wishlistService.addToWishlist(
+          created.id,
+          product.id
+        )
+
+        expect(secondAdd.id).toEqual(firstAdd.id)
+
+        const items = await wishlistService.listWishlistItems(created.id)
+        const matchingItems = items.filter(
+          (item) => item.product_id === product.id
+        )
+        expect(matchingItems).toHaveLength(1)
+        expect(
+          matchingItems[0].product?.variants?.[0].calculated_price?.amount
+        ).toBeGreaterThan(0)
+      })
+
+      it("should reject unauthenticated requests to every wishlist endpoint (AC 8)", async () => {
+        const postResponse = await api
+          .post(`/store/wishlist`, { product_id: product.id }, storeHeaders)
+          .catch((e) => e)
+        expect(postResponse.response.status).toEqual(401)
+
+        const getResponse = await api
+          .get(`/store/wishlist`, storeHeaders)
+          .catch((e) => e)
+        expect(getResponse.response.status).toEqual(401)
+
+        const deleteResponse = await api
+          .delete(`/store/wishlist/${product.id}`, storeHeaders)
+          .catch((e) => e)
+        expect(deleteResponse.response.status).toEqual(401)
       })
     })
   },
