@@ -56,6 +56,7 @@ import { authRoutesMiddlewares } from "./auth/middlewares"
 import { cloudRoutesMiddlewares } from "./cloud/middlewares"
 import { hooksRoutesMiddlewares } from "./hooks/middlewares"
 import { storeCartRoutesMiddlewares } from "./store/carts/middlewares"
+import { storeWishlistRoutesMiddlewares } from "./store/wishlist/middlewares"
 import { storeCollectionRoutesMiddlewares } from "./store/collections/middlewares"
 import { storeCurrencyRoutesMiddlewares } from "./store/currencies/middlewares"
 import { storeCustomerRoutesMiddlewares } from "./store/customers/middlewares"
@@ -93,6 +94,7 @@ export default defineMiddlewares([
   ...adminCampaignRoutesMiddlewares,
   ...storeCartRoutesMiddlewares,
   ...storeCustomerRoutesMiddlewares,
+  ...storeWishlistRoutesMiddlewares,
   ...storeCollectionRoutesMiddlewares,
   ...storeProductCategoryRoutesMiddlewares,
   ...storeProductOptionRoutesMiddlewares,

@@ -1,0 +1,636 @@
+import { medusaIntegrationTestRunner } from "@medusajs/test-utils"
+import { Modules } from "@medusajs/utils"
+import {
+  createAdminUser,
+  generatePublishableKey,
+  generateStoreHeaders,
+} from "../../../../helpers/create-admin-user"
+import { createAuthenticatedCustomer } from "../../../../modules/helpers/create-authenticated-customer"
+
+const env = {}
+const adminHeaders = { headers: { "x-medusa-access-token": "test_token" } }
+
+jest.setTimeout(600 * 1000)
+
+medusaIntegrationTestRunner({
+  env,
+  testSuite: ({ dbConnection, getContainer, api }) => {
+    let appContainer
+    let storeHeaders
+    let storeHeadersWithCustomer
+    let customer
+    let product
+    let secondProduct
+    let shippingProfile
+
+    beforeAll(async () => {
+      appContainer = getContainer()
+      await createAdminUser(dbConnection, adminHeaders, appContainer)
+      const publishableKey = await generatePublishableKey(appContainer)
+      storeHeaders = generateStoreHeaders({ publishableKey })
+
+      // The runner snapshots the database on the first test. Create the
+      // customer, publishable key, and products here so that snapshot still
+      // contains them when later tests restore.
+      const result = await createAuthenticatedCustomer(api, storeHeaders, {
+        first_name: "Test",
+        last_name: "User",
+        email: "test@wishlist.com",
+      })
+
+      customer = result.customer
+      storeHeadersWithCustomer = {
+        headers: {
+          ...storeHeaders.headers,
+          authorization: `Bearer ${result.jwt}`,
+        },
+      }
+
+      // Wishlist prices are calculated in the store's default currency.
+      // The default store is EUR; these fixtures are priced in USD.
+      const storeModule = appContainer.resolve(Modules.STORE)
+      const [store] = await storeModule.listStores(
+        {},
+        { relations: ["supported_currencies"], take: 1 }
+      )
+      if (store) {
+        await storeModule.updateStores(store.id, {
+          supported_currencies: [{ currency_code: "usd", is_default: true }],
+        })
+      }
+
+      shippingProfile = (
+        await api.post(
+          `/admin/shipping-profiles`,
+          { name: "wishlist", type: "default" },
+          adminHeaders
+        )
+      ).data.shipping_profile
+
+      product = (
+        await api.post(
+          "/admin/products",
+          {
+            title: "Test Wishlist Product",
+            status: "published",
+            shipping_profile_id: shippingProfile.id,
+            options: [{ title: "Size", values: ["S"] }],
+            variants: [
+              {
+                title: "S",
+                sku: "TEST-WISHLIST-S",
+                options: { Size: "S" },
+                manage_inventory: false,
+                prices: [{ amount: 1000, currency_code: "usd" }],
+              },
+            ],
+          },
+          adminHeaders
+        )
+      ).data.product
+
+      secondProduct = (
+        await api.post(
+          "/admin/products",
+          {
+            title: "Second Test Product",
+            status: "published",
+            shipping_profile_id: shippingProfile.id,
+            options: [{ title: "Size", values: ["M"] }],
+            variants: [
+              {
+                title: "M",
+                sku: "TEST-WISHLIST-M",
+                options: { Size: "M" },
+                manage_inventory: false,
+                prices: [{ amount: 1500, currency_code: "usd" }],
+              },
+            ],
+          },
+          adminHeaders
+        )
+      ).data.product
+    })
+
+    describe("Wishlist Service Layer Tests (Story 1)", () => {
+      describe("Service idempotency", () => {
+        it("should return the same wishlist item when adding the same product twice", async () => {
+          const container = getContainer()
+          const wishlistService = container.resolve("wishlistService")
+          const customerModule = container.resolve(Modules.CUSTOMER)
+          const productModule = container.resolve(Modules.PRODUCT)
+
+          const customer = await customerModule.createCustomers({
+            email: "test@example.com",
+          })
+          const product = await productModule.createProducts({
+            title: "Test Product",
+            status: "published",
+          })
+
+          const firstAdd = await wishlistService.addToWishlist(
+            customer.id,
+            product.id
+          )
+
+          const secondAdd = await wishlistService.addToWishlist(
+            customer.id,
+            product.id
+          )
+
+          expect(secondAdd.id).toEqual(firstAdd.id)
+
+          const connection = container.resolve("dbConnection")
+          const result = await connection.raw(
+            `SELECT COUNT(*) FROM wishlist WHERE customer_id = ? AND product_id = ?`,
+            [customer.id, product.id]
+          )
+          expect(parseInt(result.rows[0].count)).toEqual(1)
+        })
+      })
+
+      describe("Cascade delete behavior", () => {
+        it("should automatically remove wishlist item when product is deleted", async () => {
+          const container = getContainer()
+          const wishlistService = container.resolve("wishlistService")
+          const customerModule = container.resolve(Modules.CUSTOMER)
+          const productModule = container.resolve(Modules.PRODUCT)
+
+          const customer = await customerModule.createCustomers({
+            email: "cascade-test@example.com",
+          })
+          const product = await productModule.createProducts({
+            title: "Cascade Test Product",
+            status: "published",
+          })
+
+          await wishlistService.addToWishlist(customer.id, product.id)
+
+          await productModule.deleteProducts([product.id])
+
+          const items = await wishlistService.listWishlistItems(customer.id)
+          expect(items).toHaveLength(0)
+        })
+      })
+
+      describe("N+1 query prevention", () => {
+        it("should eagerly load product relation and avoid N+1 queries", async () => {
+          const container = getContainer()
+          const wishlistService = container.resolve("wishlistService")
+          const customerModule = container.resolve(Modules.CUSTOMER)
+          const productModule = container.resolve(Modules.PRODUCT)
+
+          const customer = await customerModule.createCustomers({
+            email: "n-plus-one-test@example.com",
+          })
+
+          const product1 = await productModule.createProducts({
+            title: "Product 1",
+            thumbnail: "thumb1.jpg",
+            status: "published",
+          })
+          const product2 = await productModule.createProducts({
+            title: "Product 2",
+            thumbnail: "thumb2.jpg",
+            status: "published",
+          })
+
+          await wishlistService.addToWishlist(customer.id, product1.id)
+          await wishlistService.addToWishlist(customer.id, product2.id)
+
+          const connection = container.resolve("dbConnection")
+          const originalQuery = connection.query?.bind(connection)
+          const queries: string[] = []
+
+          if (originalQuery) {
+            connection.query = function (...args: any[]) {
+              queries.push(args[0])
+              return originalQuery(...args)
+            }
+          }
+
+          const items = await wishlistService.listWishlistItems(customer.id)
+
+          if (originalQuery) {
+            connection.query = originalQuery
+          }
+
+          expect(items).toHaveLength(2)
+          expect(items[0].product).toBeDefined()
+          expect(items[0].product.title).toBeDefined()
+          expect(items[0].product.thumbnail).toBeDefined()
+          expect(items[1].product).toBeDefined()
+          expect(items[1].product.title).toBeDefined()
+          expect(items[1].product.thumbnail).toBeDefined()
+
+          const selectQueries = queries.filter((q) =>
+            String(q).toLowerCase().includes("select")
+          )
+          expect(selectQueries.length).toBeLessThanOrEqual(2)
+        })
+      })
+    })
+
+    describe("Store wishlist API (Story 2)", () => {
+      beforeEach(async () => {
+        const connection = getContainer().resolve("dbConnection")
+        await connection("wishlist")
+          .where({ customer_id: customer.id })
+          .delete()
+      })
+
+      describe("POST /store/wishlist (Story 2)", () => {
+        it("should add a product to authenticated customer's wishlist (AC 1)", async () => {
+          const response = await api.post(
+            `/store/wishlist`,
+            { product_id: product.id },
+            storeHeadersWithCustomer
+          )
+
+          expect(response.status).toEqual(200)
+          expect(response.data.wishlist_item).toEqual(
+            expect.objectContaining({
+              id: expect.any(String),
+              customer_id: customer.id,
+              product_id: product.id,
+              created_at: expect.any(String),
+              updated_at: expect.any(String),
+            })
+          )
+        })
+
+        it("should return the existing item when the product is already saved (AC 4)", async () => {
+          const first = await api.post(
+            `/store/wishlist`,
+            { product_id: product.id },
+            storeHeadersWithCustomer
+          )
+          const second = await api.post(
+            `/store/wishlist`,
+            { product_id: product.id },
+            storeHeadersWithCustomer
+          )
+
+          expect(second.status).toEqual(200)
+          expect(second.data.wishlist_item.id).toEqual(
+            first.data.wishlist_item.id
+          )
+
+          const list = await api.get(
+            `/store/wishlist`,
+            storeHeadersWithCustomer
+          )
+          expect(list.data.count).toEqual(1)
+        })
+
+        it("should reject unauthenticated add request (AC 7)", async () => {
+          const { response } = await api
+            .post(`/store/wishlist`, { product_id: product.id }, storeHeaders)
+            .catch((e) => e)
+
+          expect(response.status).toEqual(401)
+        })
+      })
+
+      describe("GET /store/wishlist (Story 2)", () => {
+        beforeEach(async () => {
+          await api.post(
+            `/store/wishlist`,
+            { product_id: product.id },
+            storeHeadersWithCustomer
+          )
+          await api.post(
+            `/store/wishlist`,
+            { product_id: secondProduct.id },
+            storeHeadersWithCustomer
+          )
+        })
+
+        it("should list all wishlist items for authenticated customer (AC 2)", async () => {
+          const response = await api.get(
+            `/store/wishlist`,
+            storeHeadersWithCustomer
+          )
+
+          expect(response.status).toEqual(200)
+          expect(response.data.count).toEqual(2)
+          expect(response.data.wishlist_items).toHaveLength(2)
+          expect(response.data.wishlist_items[0]).toEqual(
+            expect.objectContaining({
+              id: expect.any(String),
+              customer_id: customer.id,
+              product_id: expect.any(String),
+            })
+          )
+        })
+
+        it("should return the same items after the customer signs in again (AC 5)", async () => {
+          const signin = await api.post("/auth/customer/emailpass", {
+            email: "test@wishlist.com",
+            password: "secret_password",
+          })
+          const signedInAgain = {
+            headers: {
+              ...storeHeaders.headers,
+              authorization: `Bearer ${signin.data.token}`,
+            },
+          }
+
+          const response = await api.get(`/store/wishlist`, signedInAgain)
+
+          expect(response.status).toEqual(200)
+          expect(response.data.count).toEqual(2)
+          expect(response.data.wishlist_items).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({
+                customer_id: customer.id,
+                product_id: product.id,
+              }),
+              expect.objectContaining({
+                customer_id: customer.id,
+                product_id: secondProduct.id,
+              }),
+            ])
+          )
+        })
+      })
+
+      describe("DELETE /store/wishlist/:product_id (Story 2)", () => {
+        beforeEach(async () => {
+          await api.post(
+            `/store/wishlist`,
+            { product_id: product.id },
+            storeHeadersWithCustomer
+          )
+        })
+
+        it("should remove product from wishlist (AC 3)", async () => {
+          const deleteResponse = await api.delete(
+            `/store/wishlist/${product.id}`,
+            storeHeadersWithCustomer
+          )
+
+          expect(deleteResponse.status).toEqual(200)
+          expect(deleteResponse.data).toEqual({
+            deleted: true,
+            id: product.id,
+          })
+
+          const listResponse = await api.get(
+            `/store/wishlist`,
+            storeHeadersWithCustomer
+          )
+
+          expect(listResponse.data.count).toEqual(0)
+          expect(listResponse.data.wishlist_items).toHaveLength(0)
+        })
+      })
+
+      it("should return an empty list when the customer has no items (AC 6)", async () => {
+        const response = await api.get(
+          `/store/wishlist`,
+          storeHeadersWithCustomer
+        )
+
+        expect(response.status).toEqual(200)
+        expect(response.data).toEqual({
+          wishlist_items: [],
+          count: 0,
+        })
+      })
+    })
+
+    describe("Wishlist persistence and product details (Story 3)", () => {
+      it("should persist wishlist items when the customer signs in again (AC 5)", async () => {
+        const result = await createAuthenticatedCustomer(api, storeHeaders, {
+          first_name: "Persistence",
+          last_name: "Test",
+          email: `persistence-${Date.now()}@wishlist.com`,
+        })
+        const headers = {
+          headers: {
+            ...storeHeaders.headers,
+            authorization: `Bearer ${result.jwt}`,
+          },
+        }
+
+        const addResponse = await api.post(
+          `/store/wishlist`,
+          { product_id: product.id },
+          headers
+        )
+        const wishlistItemId = addResponse.data.wishlist_item.id
+
+        const signin = await api.post("/auth/customer/emailpass", {
+          email: result.customer.email,
+          password: "secret_password",
+        })
+        const signedInAgain = {
+          headers: {
+            ...storeHeaders.headers,
+            authorization: `Bearer ${signin.data.token}`,
+          },
+        }
+
+        const listResponse = await api.get(`/store/wishlist`, signedInAgain)
+
+        expect(listResponse.status).toEqual(200)
+        expect(listResponse.data.count).toEqual(1)
+        expect(listResponse.data.wishlist_items).toHaveLength(1)
+        expect(listResponse.data.wishlist_items[0]).toEqual(
+          expect.objectContaining({
+            id: wishlistItemId,
+            customer_id: result.customer.id,
+            product_id: product.id,
+          })
+        )
+      })
+
+      it("should return an empty list for a customer with no wishlist items (AC 7)", async () => {
+        const result = await createAuthenticatedCustomer(api, storeHeaders, {
+          first_name: "Empty",
+          last_name: "Wishlist",
+          email: `empty-${Date.now()}@wishlist.com`,
+        })
+        const authHeaders = {
+          headers: {
+            ...storeHeaders.headers,
+            authorization: `Bearer ${result.jwt}`,
+          },
+        }
+
+        const response = await api.get(`/store/wishlist`, authHeaders)
+
+        expect(response.status).toEqual(200)
+        expect(response.data).toEqual({
+          wishlist_items: [],
+          count: 0,
+        })
+      })
+
+      it("should return product name, image, and calculated price (AC 6)", async () => {
+        const detailProduct = (
+          await api.post(
+            "/admin/products",
+            {
+              title: "Product Details Test Item",
+              thumbnail: "https://example.com/thumbnail.jpg",
+              status: "published",
+              shipping_profile_id: shippingProfile.id,
+              options: [{ title: "Size", values: ["S", "M"] }],
+              variants: [
+                {
+                  title: "Small",
+                  sku: `DETAIL-TEST-S-${Date.now()}`,
+                  options: { Size: "S" },
+                  manage_inventory: false,
+                  prices: [{ amount: 1000, currency_code: "usd" }],
+                },
+                {
+                  title: "Medium",
+                  sku: `DETAIL-TEST-M-${Date.now()}`,
+                  options: { Size: "M" },
+                  manage_inventory: false,
+                  prices: [{ amount: 1200, currency_code: "usd" }],
+                },
+              ],
+            },
+            adminHeaders
+          )
+        ).data.product
+
+        const result = await createAuthenticatedCustomer(api, storeHeaders, {
+          first_name: "Details",
+          last_name: "Test",
+          email: `details-${Date.now()}@example.com`,
+        })
+        const authHeaders = {
+          headers: {
+            ...storeHeaders.headers,
+            authorization: `Bearer ${result.jwt}`,
+          },
+        }
+
+        await api.post(
+          `/store/wishlist`,
+          { product_id: detailProduct.id },
+          authHeaders
+        )
+
+        const response = await api.get(`/store/wishlist`, authHeaders)
+
+        expect(response.status).toEqual(200)
+        expect(response.data.count).toEqual(1)
+        expect(response.data.wishlist_items[0]).toEqual(
+          expect.objectContaining({
+            product_id: detailProduct.id,
+            product: expect.objectContaining({
+              id: detailProduct.id,
+              title: "Product Details Test Item",
+              thumbnail: "https://example.com/thumbnail.jpg",
+              variants: expect.arrayContaining([
+                expect.objectContaining({
+                  id: expect.any(String),
+                  title: expect.any(String),
+                  calculated_price: expect.objectContaining({
+                    amount: expect.any(Number),
+                    currency_code: "usd",
+                  }),
+                }),
+              ]),
+            }),
+          })
+        )
+
+        const variants = response.data.wishlist_items[0].product.variants
+        expect(variants.length).toBeGreaterThan(0)
+        expect(variants[0].calculated_price).toBeDefined()
+        expect(variants[0].calculated_price.amount).toBeGreaterThan(0)
+      })
+
+      it("should return the same wishlist item id when adding a duplicate product (AC 4)", async () => {
+        const result = await createAuthenticatedCustomer(api, storeHeaders, {
+          first_name: "Idempotency",
+          last_name: "Test",
+          email: `idempotency-${Date.now()}@example.com`,
+        })
+        const authHeaders = {
+          headers: {
+            ...storeHeaders.headers,
+            authorization: `Bearer ${result.jwt}`,
+          },
+        }
+
+        const firstAdd = await api.post(
+          `/store/wishlist`,
+          { product_id: product.id },
+          authHeaders
+        )
+        const secondAdd = await api.post(
+          `/store/wishlist`,
+          { product_id: product.id },
+          authHeaders
+        )
+
+        expect(firstAdd.status).toEqual(200)
+        expect(secondAdd.status).toEqual(200)
+        expect(secondAdd.data.wishlist_item.id).toEqual(
+          firstAdd.data.wishlist_item.id
+        )
+
+        const listResponse = await api.get(`/store/wishlist`, authHeaders)
+
+        expect(listResponse.status).toEqual(200)
+        expect(listResponse.data.count).toEqual(1)
+        expect(listResponse.data.wishlist_items).toHaveLength(1)
+      })
+
+      it("should return the existing row when the unique constraint is hit (AC 4)", async () => {
+        const wishlistService = appContainer.resolve("wishlistService")
+        const customerModule = appContainer.resolve(Modules.CUSTOMER)
+        const created = await customerModule.createCustomers({
+          email: `constraint-${Date.now()}@example.com`,
+          first_name: "Constraint",
+          last_name: "Test",
+        })
+
+        const firstAdd = await wishlistService.addToWishlist(
+          created.id,
+          product.id
+        )
+        const secondAdd = await wishlistService.addToWishlist(
+          created.id,
+          product.id
+        )
+
+        expect(secondAdd.id).toEqual(firstAdd.id)
+
+        const items = await wishlistService.listWishlistItems(created.id)
+        const matchingItems = items.filter(
+          (item) => item.product_id === product.id
+        )
+        expect(matchingItems).toHaveLength(1)
+        expect(
+          matchingItems[0].product?.variants?.[0].calculated_price?.amount
+        ).toBeGreaterThan(0)
+      })
+
+      it("should reject unauthenticated requests to every wishlist endpoint (AC 8)", async () => {
+        const postResponse = await api
+          .post(`/store/wishlist`, { product_id: product.id }, storeHeaders)
+          .catch((e) => e)
+        expect(postResponse.response.status).toEqual(401)
+
+        const getResponse = await api
+          .get(`/store/wishlist`, storeHeaders)
+          .catch((e) => e)
+        expect(getResponse.response.status).toEqual(401)
+
+        const deleteResponse = await api
+          .delete(`/store/wishlist/${product.id}`, storeHeaders)
+          .catch((e) => e)
+        expect(deleteResponse.response.status).toEqual(401)
+      })
+    })
+  },
+})

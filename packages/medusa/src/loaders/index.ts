@@ -30,6 +30,7 @@ import requestIp from "request-ip"
 import adminLoader from "./admin"
 import apiLoader from "./api"
 import { loadSearchIndexes } from "./search"
+import { loadWishlist } from "./wishlist"
 
 type Options = {
   directory: string
@@ -200,6 +201,9 @@ export default async ({
     modules,
     gqlSchema,
   } = await new MedusaAppLoader().load()
+
+  // Customer and product tables exist only after module migrations.
+  await loadWishlist(container)
 
   const workflowsSourcePaths = plugins.map((p) => join(p.resolve, "workflows"))
   const workflowLoader = new WorkflowLoader(workflowsSourcePaths, container)
