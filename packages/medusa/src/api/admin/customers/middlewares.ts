@@ -221,6 +221,30 @@ export const adminCustomerRoutesMiddlewares: MiddlewareRoute[] = [
     ],
   },
   {
+    method: ["GET"],
+    matcher: "/admin/customers/:customer_id/wishlist",
+    middlewares: [
+      authorize([
+        {
+          resource: Entities.customer,
+          operation: PolicyOperation.read,
+        },
+      ]),
+    ],
+  },
+  {
+    method: ["DELETE"],
+    matcher: "/admin/customers/:customer_id/wishlist/:product_id",
+    middlewares: [
+      authorize([
+        {
+          resource: Entities.customer,
+          operation: PolicyOperation.update,
+        },
+      ]),
+    ],
+  },
+  {
     method: ["POST"],
     matcher: "/admin/customers/export",
     middlewares: [

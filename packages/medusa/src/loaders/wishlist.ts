@@ -7,7 +7,7 @@ import {
   CREATE_WISHLIST_PRODUCT_INDEX_SQL,
   CREATE_WISHLIST_TABLE_SQL,
 } from "../migrations/20261123120000-CreateWishlistTable"
-import { WishlistService } from "../services/wishlist"
+import { WISHLIST_SERVICE, WishlistService } from "../services/wishlist"
 
 /**
  * Creates the wishlist table when core module migrations have already created
@@ -28,7 +28,7 @@ export async function loadWishlist(container: MedusaContainer): Promise<void> {
   }
 
   container.register({
-    wishlistService: asValue(new WishlistService(container)),
+    [WISHLIST_SERVICE]: asValue(new WishlistService(container)),
     dbConnection: asValue(pgConnection),
   })
 }

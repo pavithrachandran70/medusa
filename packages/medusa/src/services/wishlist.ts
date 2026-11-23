@@ -12,6 +12,9 @@ import {
 } from "@medusajs/framework/utils"
 import { Wishlist } from "../models/wishlist"
 
+/** Container registration name for {@link WishlistService}. */
+export const WISHLIST_SERVICE = "wishlistService"
+
 type WishlistRow = {
   id: string
   customer_id: string
